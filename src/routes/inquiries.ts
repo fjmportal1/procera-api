@@ -61,6 +61,7 @@ function mapItem(row: Record<string, unknown>) {
     bidItemDescription: row['bid_item_description'],
     bidShippingTerm: row['bid_shipping_term'],
     supplier: row['supplier'],
+    supplierUrl: row['supplier_url'],
     hargaBeli: row['harga_beli'],
     leadTime: row['lead_time'],
     moq: row['moq'],
@@ -82,6 +83,12 @@ function mapItem(row: Record<string, unknown>) {
 }
 
 function mapInquiry(row: Record<string, unknown>, items: Array<Record<string, unknown>>) {
+  const itemNeedByDate = items
+    .map((item) => item['item_need_by_date'])
+    .filter((date): date is string => typeof date === 'string' && date !== '')
+    .sort()[0] ?? null;
+  const needByDate = row['deadline_quotation'] || itemNeedByDate;
+
   return {
     id: row['id'],
     rfqNo: row['rfq_no'],
@@ -99,7 +106,7 @@ function mapInquiry(row: Record<string, unknown>, items: Array<Record<string, un
     updatedBy: row['updated_by'],
     sentIncomplete: row['sent_incomplete'] === 1,
     sentIncompleteReason: row['sent_incomplete_reason'] ?? null,
-    needByDate: row['deadline_quotation'] ?? null,
+    needByDate,
     sourcingMissed: row['sourcing_missed'] === 1,
     priceApprovalStartedAt: row['price_approval_started_at'] ?? null,
     items: items.map(mapItem),
@@ -224,14 +231,21 @@ function autoMarkMissedRfqs(): void {
     SET sourcing_missed = 1, status = 'missed', updated_at = datetime('now')
     WHERE sourcing_missed = 0
       AND status = 'rfq'
-      AND deadline_quotation IS NOT NULL
-      AND date(deadline_quotation) < date('now')
-      AND NOT EXISTS (
+      AND EXISTS (
         SELECT 1 FROM inquiry_items ii
-        WHERE ii.inquiry_id = inquiries.id
-          AND COALESCE(ii.supplier,'') != ''
-          AND ii.harga_beli IS NOT NULL
-          AND COALESCE(ii.lead_time,'') != ''
+        WHERE ii.inquiry_id = inquiries.id AND ii.item_need_by_date IS NOT NULL
+          AND date(ii.item_need_by_date) < date('now')
+      )
+      AND (
+        (sourcing_pic IS NULL OR sourcing_pic = '')
+        OR NOT EXISTS (
+          SELECT 1 FROM inquiry_items ii
+          WHERE ii.inquiry_id = inquiries.id
+            AND COALESCE(ii.supplier,'') NOT IN ('', '-')
+            AND ii.harga_beli IS NOT NULL AND ii.harga_beli > 0
+            AND COALESCE(ii.lead_time,'') != ''
+            AND ii.ppn_type IS NOT NULL
+        )
       )
   `).run();
 }
@@ -265,8 +279,8 @@ inquiriesRouter.get('/report', (req: Request, res: Response) => {
   const rows = db.prepare(`
     SELECT
       i.id, i.rfq_no, i.customer, i.sales_pic, i.sourcing_pic, i.tanggal, i.status,
-      MIN(ii.item_need_by_date) AS need_by_date,
-      CAST(julianday(MIN(ii.item_need_by_date)) - julianday(date(i.tanggal)) AS INTEGER) AS timeline_days,
+      COALESCE(NULLIF(i.deadline_quotation, ''), MIN(ii.item_need_by_date)) AS need_by_date,
+      CAST(julianday(COALESCE(NULLIF(i.deadline_quotation, ''), MIN(ii.item_need_by_date))) - julianday(date(i.tanggal)) AS INTEGER) AS timeline_days,
       CAST(julianday(date(al_sent.sent_at, '+7 hours')) - julianday(date(i.tanggal)) AS INTEGER) AS days_taken
     FROM inquiries i
     LEFT JOIN inquiry_items ii
@@ -298,7 +312,7 @@ inquiriesRouter.get('/report/sourcing', (req: Request, res: Response) => {
   const rows = db.prepare(`
     SELECT
       i.id, i.rfq_no, i.customer, i.sales_pic, i.sourcing_pic, i.tanggal, i.status,
-      MIN(ii.item_need_by_date) AS need_by_date,
+      COALESCE(NULLIF(i.deadline_quotation, ''), MIN(ii.item_need_by_date)) AS need_by_date,
       COUNT(ii.id) AS total_items,
       SUM(CASE WHEN COALESCE(ii.supplier,'') != '' AND ii.harga_beli IS NOT NULL AND COALESCE(ii.lead_time,'') != '' THEN 1 ELSE 0 END) AS sourced_items
     FROM inquiries i
@@ -334,7 +348,7 @@ inquiriesRouter.get('/report/export', (req: Request, res: Response) => {
   }
   if (dateFrom || dateTo) {
     const dateExpr = dateField === 'need_by_date'
-      ? `(SELECT MIN(item_need_by_date) FROM inquiry_items WHERE inquiry_id = i.id)`
+      ? `COALESCE(NULLIF(i.deadline_quotation, ''), (SELECT MIN(item_need_by_date) FROM inquiry_items WHERE inquiry_id = i.id))`
       : `date(i.tanggal)`;
     if (dateFrom) { where += ` AND ${dateExpr} >= ?`; params.push(String(dateFrom)); }
     if (dateTo)   { where += ` AND ${dateExpr} <= ?`; params.push(String(dateTo)); }
@@ -343,8 +357,8 @@ inquiriesRouter.get('/report/export', (req: Request, res: Response) => {
   const summaryRows = db.prepare(`
     SELECT
       i.id, i.rfq_no, i.customer, i.sales_pic, i.sourcing_pic, i.tanggal, i.status,
-      MIN(ii.item_need_by_date) AS need_by_date,
-      CAST(julianday(MIN(ii.item_need_by_date)) - julianday(date(i.tanggal)) AS INTEGER) AS timeline_days,
+      COALESCE(NULLIF(i.deadline_quotation, ''), MIN(ii.item_need_by_date)) AS need_by_date,
+      CAST(julianday(COALESCE(NULLIF(i.deadline_quotation, ''), MIN(ii.item_need_by_date))) - julianday(date(i.tanggal)) AS INTEGER) AS timeline_days,
       CAST(julianday(date(al_sent.sent_at, '+7 hours')) - julianday(date(i.tanggal)) AS INTEGER) AS days_taken
     FROM inquiries i
     LEFT JOIN inquiry_items ii ON ii.inquiry_id = i.id AND ii.item_need_by_date IS NOT NULL
@@ -361,7 +375,7 @@ inquiriesRouter.get('/report/export', (req: Request, res: Response) => {
     ? db.prepare(`
         SELECT i.rfq_no, i.customer, i.sales_pic, i.sourcing_pic, i.tanggal,
           ii.item_name, ii.item_quantity, ii.item_uom, ii.item_need_by_date,
-          ii.supplier, ii.harga_beli, ii.harga_jual, ii.margin,
+          ii.supplier, ii.supplier_url, ii.harga_beli, ii.harga_jual, ii.margin,
           ii.lead_time, ii.moq, ii.stock_availability, ii.ppn_type
         FROM inquiry_items ii
         JOIN inquiries i ON i.id = ii.inquiry_id
@@ -406,7 +420,7 @@ inquiriesRouter.get('/report/export', (req: Request, res: Response) => {
 
   // Sheet 2: Items
   const itemHeaders = isPurchasingExport
-    ? ['RFQ No', 'Customer', 'Sales PIC', 'Sourcing PIC', 'Inquiry Date', 'Item Name', 'Qty', 'UOM', 'Need By Date', 'Supplier', 'Harga Beli', 'Lead Time', 'MOQ', 'Stock', 'PPN Type']
+    ? ['RFQ No', 'Customer', 'Sales PIC', 'Sourcing PIC', 'Inquiry Date', 'Item Name', 'Qty', 'UOM', 'Need By Date', 'Supplier', 'Supplier URL', 'Harga Beli', 'Lead Time', 'MOQ', 'Stock', 'PPN Type']
     : ['RFQ No', 'Customer', 'Sales PIC', 'Sourcing PIC', 'Inquiry Date', 'Item Name', 'Qty', 'UOM', 'Need By Date', 'Supplier', 'Harga Beli', 'Harga Jual', 'Margin (%)', 'Lead Time', 'MOQ', 'Stock', 'PPN Type'];
 
   const itemsData = [
@@ -419,7 +433,7 @@ inquiriesRouter.get('/report/export', (req: Request, res: Response) => {
             r['tanggal'] ? String(r['tanggal']).slice(0, 10) : '',
             r['item_name'] ?? '', r['item_quantity'] ?? '', r['item_uom'] ?? '',
             r['item_need_by_date'] ? String(r['item_need_by_date']).slice(0, 10) : '',
-            r['supplier'] ?? '', r['harga_beli'] ?? '',
+            r['supplier'] ?? '', r['supplier_url'] ?? '', r['harga_beli'] ?? '',
             r['lead_time'] ?? '', r['moq'] ?? '',
             r['stock_availability'] ?? '', r['ppn_type'] ?? '',
           ]
@@ -634,12 +648,18 @@ inquiriesRouter.get('/dashboard', (_req: Request, res: Response) => {
   ).all() as Array<{ sourcing_pic: string; items_count: number }>;
 
   const urgentRfqs = db.prepare(
-    `SELECT id, rfq_no, customer, sourcing_pic, deadline_quotation,
-       CAST(julianday(deadline_quotation) - julianday('now') AS INTEGER) as days_left
-     FROM inquiries
-     WHERE status = 'rfq' AND sourcing_missed = 0 AND deadline_quotation IS NOT NULL
-     ORDER BY deadline_quotation ASC LIMIT 8`
-  ).all() as Array<{ id: string; rfq_no: string; customer: string; sourcing_pic: string | null; deadline_quotation: string; days_left: number }>;
+    `SELECT i.id, i.rfq_no, i.customer, i.sourcing_pic,
+       COALESCE(NULLIF(i.deadline_quotation, ''), MIN(ii.item_need_by_date)) AS need_by_date,
+       CAST(julianday(COALESCE(NULLIF(i.deadline_quotation, ''), MIN(ii.item_need_by_date))) - julianday(date('now', 'localtime')) AS INTEGER) AS days_left
+     FROM inquiries i
+     LEFT JOIN inquiry_items ii ON ii.inquiry_id = i.id
+     WHERE i.status = 'rfq'
+       AND i.sourcing_missed = 0
+     GROUP BY i.id
+     HAVING need_by_date IS NOT NULL AND need_by_date != ''
+       AND days_left >= 0 AND days_left <= 1
+     ORDER BY need_by_date ASC LIMIT 8`
+  ).all() as Array<{ id: string; rfq_no: string; customer: string; sourcing_pic: string | null; need_by_date: string; days_left: number }>;
 
   res.json({
     total, thisMonth, quotationSent, unsent, conversionRate, topSales, topMarketing, statusBreakdown,
@@ -667,10 +687,15 @@ inquiriesRouter.get('/:id([^/]{1,})', (req: Request, res: Response) => {
 
 // POST /inquiries/import-coupa
 inquiriesRouter.post('/import-coupa', (req: Request, res: Response) => {
-  const { fileBase64, fileName, createdBy, createdByName, organization } = req.body as Record<string, unknown>;
+  const { fileBase64, fileName, createdBy, createdByName, organization, needByDate } = req.body as Record<string, unknown>;
   const org = normalizeOrganization(organization);
   if (!fileBase64 || !fileName || !createdBy || !org) {
     res.status(400).json({ error: 'fileBase64, fileName, createdBy, organization are required. Organization must exist in Settings.' });
+    return;
+  }
+  const overrideNeedByDate = typeof needByDate === 'string' && needByDate.trim() ? needByDate.trim() : null;
+  if (!overrideNeedByDate) {
+    res.status(400).json({ error: 'needByDate is required.' });
     return;
   }
 
@@ -727,7 +752,7 @@ inquiriesRouter.post('/import-coupa', (req: Request, res: Response) => {
       item_name: readSheetCell(sheet, r, fieldMap['item.name']),
       item_quantity: toNumber(readSheetCell(sheet, r, fieldMap['item.quantity'])),
       item_uom: readSheetCell(sheet, r, fieldMap['item.uom']),
-      item_need_by_date: parseExcelDate(readSheetCell(sheet, r, fieldMap['item.need_by_date'])),
+      item_need_by_date: overrideNeedByDate,
       item_manufacturer_name: readSheetCell(sheet, r, fieldMap['item.manufacturer_name']),
       item_manufacturer_part_number: readSheetCell(sheet, r, fieldMap['item.manufacturer_part_number']),
       item_classification_of_goods: readSheetCell(sheet, r, fieldMap['item.classification_of_goods']),
@@ -761,9 +786,9 @@ inquiriesRouter.post('/import-coupa', (req: Request, res: Response) => {
 
   const tx = db.transaction(() => {
     db.prepare(
-      `INSERT INTO inquiries (id, rfq_no, tanggal, customer, sales_pic, nama_barang, status, coupa_source, organization, coupa_file_name, created_at, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, 'new_inquiry', 1, ?, ?, ?, ?)`
-    ).run(id, rfqNo, tanggal, customer, salesPic, namaBarang, org, String(fileName), createdAt, createdBy);
+      `INSERT INTO inquiries (id, rfq_no, tanggal, customer, sales_pic, nama_barang, deadline_quotation, status, coupa_source, organization, coupa_file_name, created_at, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'new_inquiry', 1, ?, ?, ?, ?)`
+    ).run(id, rfqNo, tanggal, customer, salesPic, namaBarang, overrideNeedByDate, org, String(fileName), createdAt, createdBy);
 
     const insertItem = db.prepare(
       `INSERT INTO inquiry_items (
@@ -1086,16 +1111,21 @@ inquiriesRouter.put('/:id', (req: Request, res: Response) => {
     res.status(400).json({ error: 'Cannot edit inquiry at this stage.' }); return;
   }
 
-  const { customer, salesPic, namaBarang, spesifikasi, qty, itemUom, itemNeedByDate, itemManufacturerName, itemManufacturerPartNumber, itemClassificationOfGoods, deadlineQuotation, lampiran, updatedBy, updatedByName } =
-    req.body as Record<string, unknown>;
-  const org = req.body ? normalizeOrganization((req.body as Record<string, unknown>)['organization']) : null;
-  if ((req.body as Record<string, unknown>)['organization'] != null && !org) {
+  const body = req.body as Record<string, unknown>;
+  const { customer, salesPic, namaBarang, spesifikasi, qty, itemUom, itemNeedByDate, itemManufacturerName, itemManufacturerPartNumber, itemClassificationOfGoods, itemImage, deadlineQuotation, lampiran, updatedBy, updatedByName } =
+    body;
+  const org = req.body ? normalizeOrganization(body['organization']) : null;
+  if (body['organization'] != null && !org) {
     res.status(400).json({ error: 'organization must exist in Settings.' }); return;
   }
 
   const needByDate = itemNeedByDate ?? deadlineQuotation ?? null;
+  const rawItems = Array.isArray(body['items']) ? body['items'] as Array<Record<string, unknown>> : null;
+  if (rawItems && rawItems.length === 0) {
+    res.status(400).json({ error: 'At least one item is required.' }); return;
+  }
 
-  db.prepare(
+  const updateInquiry = db.prepare(
     `UPDATE inquiries SET
        customer = COALESCE(?, customer), sales_pic = COALESCE(?, sales_pic),
        organization = COALESCE(?, organization),
@@ -1103,24 +1133,69 @@ inquiriesRouter.put('/:id', (req: Request, res: Response) => {
        deadline_quotation = ?, lampiran = ?,
        updated_at = ?, updated_by = ?
      WHERE id = ?`
-  ).run(customer ?? null, salesPic ?? null, org ?? null, namaBarang ?? null, spesifikasi ?? null, qty ?? null, needByDate, lampiran ?? null, new Date().toISOString(), updatedBy ?? null, id);
+  );
+  const updateSingleItem = db.prepare(
+    `UPDATE inquiry_items SET
+       item_name = COALESCE(?, item_name),
+       item_extended_description = ?,
+       item_quantity = ?,
+       item_uom = ?,
+       item_need_by_date = ?,
+       item_manufacturer_name = ?,
+       item_manufacturer_part_number = ?,
+       item_classification_of_goods = ?,
+       item_image = ?
+     WHERE inquiry_id = ?`
+  );
+  const updateItem = db.prepare(
+    `UPDATE inquiry_items SET
+       item_name = ?,
+       item_extended_description = ?,
+       item_quantity = ?,
+       item_uom = ?,
+       item_need_by_date = ?,
+       item_image = ?
+     WHERE id = ? AND inquiry_id = ?`
+  );
+  const insertItem = db.prepare(
+    `INSERT INTO inquiry_items (id, inquiry_id, item_name, item_quantity, item_uom, item_need_by_date,
+      item_extended_description, item_image)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const deleteMissingItems = db.prepare(
+    `DELETE FROM inquiry_items
+     WHERE inquiry_id = ? AND id NOT IN (${rawItems?.map(() => '?').join(',') || "''"})`
+  );
+  const runUpdate = db.transaction(() => {
+    updateInquiry.run(customer ?? null, salesPic ?? null, org ?? null, namaBarang ?? null, spesifikasi ?? null, qty ?? null, needByDate, lampiran ?? null, new Date().toISOString(), updatedBy ?? null, id);
 
-  const itemCount = (db.prepare('SELECT COUNT(*) as c FROM inquiry_items WHERE inquiry_id = ?').get(id) as { c: number }).c;
-  if (itemCount === 1) {
-    db.prepare(
-      `UPDATE inquiry_items SET
-         item_name = COALESCE(?, item_name),
-         item_extended_description = ?,
-         item_quantity = ?,
-         item_uom = ?,
-         item_need_by_date = ?,
-         item_manufacturer_name = ?,
-         item_manufacturer_part_number = ?,
-         item_classification_of_goods = ?
-       WHERE inquiry_id = ?`
-    ).run(namaBarang ?? null, spesifikasi ?? null, qty ?? null, itemUom ?? null, needByDate,
-      itemManufacturerName ?? null, itemManufacturerPartNumber ?? null, itemClassificationOfGoods ?? null, id);
-  }
+    if (rawItems) {
+      const keptIds: string[] = [];
+      for (const item of rawItems) {
+        const itemId = typeof item['id'] === 'string' && item['id'] ? String(item['id']) : generateId();
+        const existing = db.prepare('SELECT id FROM inquiry_items WHERE id = ? AND inquiry_id = ?').get(itemId, id) as { id: string } | undefined;
+        const itemName = String(item['itemName'] ?? '').trim();
+        const itemQuantity = item['itemQuantity'] ?? null;
+        const itemUomValue = String(item['itemUom'] ?? '').trim();
+        const itemDescription = item['itemExtendedDescription'] == null ? null : String(item['itemExtendedDescription']).trim();
+        const itemImageValue = item['itemImage'] ?? null;
+        keptIds.push(itemId);
+        if (existing) {
+          updateItem.run(itemName, itemDescription, itemQuantity, itemUomValue, needByDate, itemImageValue, itemId, id);
+        } else {
+          insertItem.run(itemId, id, itemName, itemQuantity, itemUomValue, needByDate, itemDescription, itemImageValue);
+        }
+      }
+      deleteMissingItems.run(id, ...keptIds);
+    } else {
+      const itemCount = (db.prepare('SELECT COUNT(*) as c FROM inquiry_items WHERE inquiry_id = ?').get(id) as { c: number }).c;
+      if (itemCount === 1) {
+        updateSingleItem.run(namaBarang ?? null, spesifikasi ?? null, qty ?? null, itemUom ?? null, needByDate,
+          itemManufacturerName ?? null, itemManufacturerPartNumber ?? null, itemClassificationOfGoods ?? null, itemImage ?? null, id);
+      }
+    }
+  });
+  runUpdate();
 
   logActivity(id, 'Inquiry updated', inquiry.status, inquiry.status, null, String(updatedBy ?? ''), String(updatedByName ?? updatedBy ?? ''));
   res.json({ ok: true });
@@ -1241,11 +1316,15 @@ inquiriesRouter.post('/:id/sourcing-info', (req: Request, res: Response) => {
     res.status(400).json({ error: 'Inquiry must be in RFQ status.' }); return;
   }
 
-  const { supplier, hargaBeli, leadTime, moq, stockAvailability, termPembayaran, ppnType, doneBy, doneByName } =
+  const { supplier, supplierUrl, hargaBeli, leadTime, moq, stockAvailability, termPembayaran, ppnType, doneBy, doneByName } =
     req.body as Record<string, unknown>;
 
-  if (!supplier || hargaBeli === undefined || !leadTime) {
+  const supplierStr = String(supplier ?? '').trim();
+  if (!supplierStr || hargaBeli === undefined || !leadTime) {
     res.status(400).json({ error: 'supplier, hargaBeli, leadTime are required.' }); return;
+  }
+  if (!/[A-Za-z0-9]/.test(supplierStr)) {
+    res.status(400).json({ error: 'Supplier name is invalid.' }); return;
   }
   if (!ppnType) {
     res.status(400).json({ error: 'ppnType is required.' }); return;
@@ -1256,9 +1335,9 @@ inquiriesRouter.post('/:id/sourcing-info', (req: Request, res: Response) => {
   if (item.price_approved) { res.status(400).json({ error: 'Item already approved, cannot edit.' }); return; }
 
   db.prepare(
-    `UPDATE inquiry_items SET supplier = ?, harga_beli = ?, lead_time = ?, moq = ?,
+    `UPDATE inquiry_items SET supplier = ?, supplier_url = ?, harga_beli = ?, lead_time = ?, moq = ?,
        stock_availability = ?, term_pembayaran = ?, ppn_type = ? WHERE id = ?`
-  ).run(supplier, hargaBeli, leadTime, moq ?? null, stockAvailability ?? null, termPembayaran ?? null, ppnType ?? null, item.id);
+  ).run(supplierStr, supplierUrl ?? null, hargaBeli, leadTime, moq ?? null, stockAvailability ?? null, termPembayaran ?? null, ppnType ?? null, item.id);
 
   logActivity(id, 'Sourcing info submitted', 'rfq', 'rfq', null, String(doneBy ?? ''), String(doneByName ?? doneBy ?? ''));
   recalcInquiryStatus(id, String(doneBy ?? ''), String(doneByName ?? doneBy ?? ''));
@@ -1278,20 +1357,24 @@ inquiriesRouter.post('/:id/items/:itemId/sourcing-info', (req: Request, res: Res
   if (!item) { res.status(404).json({ error: 'Item not found.' }); return; }
   if (item.price_approved) { res.status(400).json({ error: 'Item already approved, cannot edit.' }); return; }
 
-  const { supplier, hargaBeli, leadTime, moq, stockAvailability, termPembayaran, alternateName, ppnType, doneBy, doneByName } =
+  const { supplier, supplierUrl, hargaBeli, leadTime, moq, stockAvailability, termPembayaran, alternateName, ppnType, doneBy, doneByName } =
     req.body as Record<string, unknown>;
 
-  if (!supplier || hargaBeli === undefined || !leadTime) {
+  const supplierStr = String(supplier ?? '').trim();
+  if (!supplierStr || hargaBeli === undefined || !leadTime) {
     res.status(400).json({ error: 'supplier, hargaBeli, leadTime are required.' }); return;
+  }
+  if (!/[A-Za-z0-9]/.test(supplierStr)) {
+    res.status(400).json({ error: 'Supplier name is invalid.' }); return;
   }
   if (!ppnType) {
     res.status(400).json({ error: 'ppnType is required.' }); return;
   }
 
   db.prepare(
-    `UPDATE inquiry_items SET supplier = ?, harga_beli = ?, lead_time = ?, moq = ?,
+    `UPDATE inquiry_items SET supplier = ?, supplier_url = ?, harga_beli = ?, lead_time = ?, moq = ?,
        stock_availability = ?, term_pembayaran = ?, alternate_name = ?, ppn_type = ? WHERE id = ?`
-  ).run(supplier, hargaBeli, leadTime, moq ?? null, stockAvailability ?? null, termPembayaran ?? null, alternateName ?? null, ppnType ?? null, itemId);
+  ).run(supplierStr, supplierUrl ?? null, hargaBeli, leadTime, moq ?? null, stockAvailability ?? null, termPembayaran ?? null, alternateName ?? null, ppnType ?? null, itemId);
 
   logActivity(id, 'Sourcing info submitted', 'rfq', 'rfq', null, String(doneBy ?? ''), String(doneByName ?? doneBy ?? ''));
   recalcInquiryStatus(id, String(doneBy ?? ''), String(doneByName ?? doneBy ?? ''));
@@ -1691,7 +1774,8 @@ inquiriesRouter.get('/:id/notes', (req: Request, res: Response) => {
 // POST /inquiries/:id/notes
 inquiriesRouter.post('/:id/notes', (req: Request, res: Response) => {
   const { id } = req.params;
-  const { note, doneBy, doneByName, role } = req.body as Record<string, unknown>;
+  const { note, doneBy, doneByName } = req.body as Record<string, unknown>;
+  const authUser = (req as any).user as { role: string };
 
   if (!note || !String(note).trim()) {
     res.status(400).json({ error: 'Note cannot be empty.' }); return;
@@ -1701,7 +1785,7 @@ inquiriesRouter.post('/:id/notes', (req: Request, res: Response) => {
     .get(id) as { id: string; sales_pic: string; sourcing_pic: string | null } | undefined;
   if (!inquiry) { res.status(404).json({ error: 'Not found.' }); return; }
 
-  const isAdminOrManager = role === 'admin' || role === 'manager';
+  const isAdminOrManager = authUser.role === 'admin' || authUser.role === 'manager';
   const isAssigned = doneByName === inquiry.sales_pic || doneByName === inquiry.sourcing_pic;
 
   if (!isAdminOrManager && !isAssigned) {
@@ -1736,7 +1820,8 @@ inquiriesRouter.get('/:id/items/:itemId/notes', (req: Request, res: Response) =>
 // POST /inquiries/:id/items/:itemId/notes
 inquiriesRouter.post('/:id/items/:itemId/notes', (req: Request, res: Response) => {
   const { id, itemId } = req.params;
-  const { note, doneBy, doneByName, role } = req.body as Record<string, unknown>;
+  const { note, doneBy, doneByName } = req.body as Record<string, unknown>;
+  const authUser = (req as any).user as { role: string };
 
   if (!note || !String(note).trim()) {
     res.status(400).json({ error: 'Note cannot be empty.' }); return;
@@ -1746,7 +1831,7 @@ inquiriesRouter.post('/:id/items/:itemId/notes', (req: Request, res: Response) =
     .get(id) as { id: string; sales_pic: string; sourcing_pic: string | null } | undefined;
   if (!inquiry) { res.status(404).json({ error: 'Not found.' }); return; }
 
-  const isAdminOrManager = role === 'admin' || role === 'manager';
+  const isAdminOrManager = authUser.role === 'admin' || authUser.role === 'manager';
   const isAssigned = doneByName === inquiry.sales_pic || doneByName === inquiry.sourcing_pic;
 
   if (!isAdminOrManager && !isAssigned) {
@@ -1764,9 +1849,10 @@ inquiriesRouter.post('/:id/items/:itemId/notes', (req: Request, res: Response) =
 // PATCH /inquiries/:id/assign-sales — admin/manager only
 inquiriesRouter.patch('/:id/assign-sales', (req: Request, res: Response) => {
   const { id } = req.params;
-  const { salesPic, doneBy, doneByName, role } = req.body as Record<string, unknown>;
+  const { salesPic, doneBy, doneByName } = req.body as Record<string, unknown>;
+  const authUser = (req as any).user as { role: string };
 
-  if (role !== 'admin' && role !== 'manager') {
+  if (authUser.role !== 'admin' && authUser.role !== 'manager') {
     res.status(403).json({ error: 'Only admin or manager can reassign Sales PIC.' }); return;
   }
   if (!salesPic || !String(salesPic).trim()) {
@@ -1802,21 +1888,22 @@ inquiriesRouter.patch('/:id/assign-sales', (req: Request, res: Response) => {
 // Admin/manager can assign any sourcing user; sourcing can self-assign if unassigned
 inquiriesRouter.patch('/:id/assign-sourcing', (req: Request, res: Response) => {
   const { id } = req.params;
-  const { sourcingPic, doneBy, doneByName, role } = req.body as Record<string, unknown>;
+  const { sourcingPic, doneBy, doneByName } = req.body as Record<string, unknown>;
+  const authUser = (req as any).user as { role: string; menus: string[] };
 
   const inquiry = db.prepare('SELECT id, rfq_no, sourcing_pic FROM inquiries WHERE id = ?')
     .get(id) as { id: string; rfq_no: string | null; sourcing_pic: string | null } | undefined;
   if (!inquiry) { res.status(404).json({ error: 'Not found.' }); return; }
 
-  const isSourcing = role === 'sourcing';
-  const isAdminOrManager = role === 'admin' || role === 'manager';
+  const isAdminOrManager = authUser.role === 'admin' || authUser.role === 'manager';
+  const hasSourcingMenu = authUser.menus?.includes('sourcing');
 
-  if (!isAdminOrManager && !isSourcing) {
+  if (!isAdminOrManager && !hasSourcingMenu) {
     res.status(403).json({ error: 'Not authorized.' }); return;
   }
 
-  // Sourcing can only self-assign and only if not already assigned
-  if (isSourcing && !isAdminOrManager) {
+  // Non-admin/manager sourcing users can only self-assign if unassigned
+  if (hasSourcingMenu && !isAdminOrManager) {
     if (inquiry.sourcing_pic) {
       res.status(400).json({ error: 'Already assigned to another sourcing user.' }); return;
     }
